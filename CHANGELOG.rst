@@ -1,6 +1,16 @@
 Changelog
 ---------
 
+5.3.0 (unreleased)
+******************
+
+Features:
+
+- Add ``doitlive edit`` command to edit a session file in ``$EDITOR``
+  before playing it back. The session is played from the exact content
+  saved in the editor, and the file on disk is only updated once the
+  session finishes normally.
+
 5.2.1 (2026-02-16)
 ******************
 

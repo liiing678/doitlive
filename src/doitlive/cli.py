@@ -3,7 +3,10 @@ import importlib.metadata
 import os
 import re
 import shlex
+import stat
+import subprocess
 import sys
+import tempfile
 import textwrap
 from codecs import open
 
@@ -419,6 +422,122 @@ def play(quiet, session_file, shell, speed, prompt, commentecho):
         prompt_template=prompt,
         commentecho=commentecho,
     )
+
+
+def get_editor():
+    """Return the editor command used by ``doitlive edit``."""
+    return env.get("DOITLIVE_EDITOR") or env.get("VISUAL") or env.get("EDITOR") or "vi"
+
+
+def edit_snapshot(initial_text, suffix=".sh"):
+    """Edit ``initial_text`` in the user's editor and return the edited text.
+
+    The text is edited in a temporary file which is always removed, whether
+    or not the editor exits cleanly. Returns ``None`` if the editor exited
+    abnormally (e.g. non-zero exit status or killed by a signal).
+    """
+    fd, tmp_path = tempfile.mkstemp(prefix="doitlive-", suffix=suffix)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fp.write(initial_text)
+        editor_cmd = shlex.split(get_editor()) + [tmp_path]
+        try:
+            returncode = subprocess.call(editor_cmd)
+        except OSError as error:
+            raise SessionError(
+                f"Could not launch editor {editor_cmd[0]!r}: {error}"
+            ) from error
+        if returncode != 0:
+            return None
+        with open(tmp_path, encoding="utf-8") as fp:
+            return fp.read()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def atomic_write(path, text):
+    """Write ``text`` to ``path`` atomically, preserving file permissions."""
+    abspath = os.path.abspath(path)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".doitlive-", suffix=".tmp", dir=os.path.dirname(abspath)
+    )
+    try:
+        if os.path.exists(abspath):
+            os.chmod(tmp_path, stat.S_IMODE(os.stat(abspath).st_mode))
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fp.write(text)
+        os.replace(tmp_path, abspath)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+@player_command
+@click.argument("session_file", type=click.Path(dir_okay=False))
+@cli.command()
+def edit(quiet, session_file, shell, speed, prompt, commentecho):
+    """Edit a session file in your editor, then play it back.
+
+    The session is played from the exact content saved in the editor. The
+    file on disk is only updated once the session finishes normally; if the
+    editor or the session exits abnormally, the file is left unchanged.
+    """
+    filename = click.format_filename(session_file)
+    if os.path.exists(session_file):
+        with open(session_file, encoding="utf-8") as fp:
+            original = fp.read()
+    else:
+        original = HEADER_TEMPLATE.format(shell=shell, prompt=prompt)
+
+    suffix = os.path.splitext(session_file)[1] or ".sh"
+    try:
+        snapshot = edit_snapshot(original, suffix=suffix)
+    except SessionError as error:
+        raise click.ClickException(str(error)) from error
+    if snapshot is None:
+        raise click.ClickException(
+            f"Editor exited abnormally. {filename} was left unchanged."
+        )
+
+    # Play back the in-memory snapshot so that editing and execution are
+    # always based on the same content, even if the file changes on disk.
+    commands = snapshot.splitlines()
+    cwd = os.getcwd()
+    oldpwd = env.get("OLDPWD")
+    try:
+        run(
+            commands,
+            shell=shell,
+            speed=speed,
+            quiet=quiet,
+            test_mode=TESTING,
+            prompt_template=prompt,
+            commentecho=commentecho,
+        )
+    except BaseException:
+        secho(
+            f"Session did not finish. {filename} was left unchanged.",
+            fg="yellow",
+            err=True,
+        )
+        raise
+    finally:
+        # Restore the working directory and $OLDPWD so that replaying the
+        # same content always starts from identical state.
+        os.chdir(cwd)
+        if oldpwd is None:
+            env.pop("OLDPWD", None)
+        else:
+            env["OLDPWD"] = oldpwd
+
+    atomic_write(session_file, snapshot)
+    secho(f"Session file updated: {filename}", fg="cyan")
 
 
 DEMO = [

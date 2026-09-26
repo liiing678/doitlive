@@ -82,6 +82,21 @@ You can record session files using the built-in recorder command.
 
 This will start a recording session. When you are finished recording, run the ``stop`` command. All commands will be written to a ``session.sh`` file.
 
+Editing before playing
+----------------------
+
+You can touch up a session file in your editor right before playing it.
+
+.. code-block:: console
+
+    $ doitlive edit session.sh
+
+This opens the session file in your editor (``$DOITLIVE_EDITOR``,
+``$VISUAL``, ``$EDITOR``, or ``vi``). When you save and quit, the exact
+content you saved is played back. The file on disk is only updated once the
+session finishes normally: if the editor or the session exits abnormally,
+the file is left unchanged.
+
 Themes
 ------
 

@@ -2,7 +2,10 @@ import getpass
 import importlib.metadata
 import os
 import random
+import stat
 import subprocess
+import sys
+import tempfile
 from contextlib import contextmanager
 
 import pytest
@@ -31,6 +34,19 @@ def run_session(runner, filename, user_input, args=None):
     # Press ENTER at beginning of session and ENTER twice at end
     user_in = "".join(["\n", user_input, "\n\n"])
     return runner.invoke(cli, ["play", session] + args, input=user_in)
+
+
+def make_editor(tmp_path, script):
+    """Create a fake editor (a Python script) and return it as an env dict."""
+    editor = tmp_path / "editor.py"
+    editor.write_text(script)
+    return {"DOITLIVE_EDITOR": f"{sys.executable} {editor}"}
+
+
+def run_edit(runner, session_path, user_input, env):
+    # Press ENTER at beginning of session and ENTER twice at end
+    user_in = "".join(["\n", user_input, "\n\n"])
+    return runner.invoke(cli, ["edit", str(session_path)], input=user_in, env=env)
 
 
 class TestPlayer:
@@ -194,6 +210,148 @@ class TestPlayer:
         )
         result = run_session(runner, "alias.session", user_input)
         assert "42" in result.output
+
+
+class TestEdit:
+    def test_plays_snapshot_and_commits_on_success(self, runner, tmp_path):
+        session = tmp_path / "session.sh"
+        session.write_text("echo original\n")
+        env = make_editor(
+            tmp_path,
+            "import sys\n"
+            "with open(sys.argv[1], 'w') as f:\n"
+            "    f.write('echo edited-snapshot\\n')\n",
+        )
+        result = run_edit(
+            runner, session, random_string(len("echo edited-snapshot")), env
+        )
+        assert result.exit_code == 0
+        assert "edited-snapshot" in result.output
+        assert session.read_text() == "echo edited-snapshot\n"
+
+    def test_execution_uses_snapshot_not_file_on_disk(self, runner, tmp_path):
+        # Editing and execution must be based on the same content snapshot,
+        # even if the session file is modified on disk after editing.
+        session = tmp_path / "session.sh"
+        session.write_text("echo original\n")
+        env = make_editor(
+            tmp_path,
+            "import os, sys\n"
+            "with open(sys.argv[1], 'w') as f:\n"
+            "    f.write('echo from-snapshot\\n')\n"
+            "with open(os.environ['SESSION_PATH'], 'w') as f:\n"
+            "    f.write('echo tampered\\n')\n",
+        )
+        env["SESSION_PATH"] = str(session)
+        result = run_edit(
+            runner, session, random_string(len("echo from-snapshot")), env
+        )
+        assert result.exit_code == 0
+        assert "from-snapshot" in result.output
+        assert "tampered" not in result.output
+        assert session.read_text() == "echo from-snapshot\n"
+
+    def test_editor_killed_restores_and_cleans_up(self, runner, tmp_path, monkeypatch):
+        session = tmp_path / "session.sh"
+        original = "echo original\n"
+        session.write_text(original)
+        env = make_editor(
+            tmp_path,
+            "import os, signal, sys\n"
+            "with open(sys.argv[1], 'w') as f:\n"
+            "    f.write('echo should-not-survive\\n')\n"
+            "os.kill(os.getpid(), signal.SIGTERM)\n",
+        )
+        tmpdir = tmp_path / "tmp"
+        tmpdir.mkdir()
+        monkeypatch.setenv("TMPDIR", str(tmpdir))
+        monkeypatch.setattr(tempfile, "tempdir", None)
+        result = run_edit(runner, session, "", env)
+        assert result.exit_code != 0
+        assert session.read_text() == original
+        assert "should-not-survive" not in result.output
+        assert os.listdir(tmpdir) == []
+
+    def test_editor_failure_leaves_file_unchanged(self, runner, tmp_path):
+        session = tmp_path / "session.sh"
+        original = "echo original\n"
+        session.write_text(original)
+        env = make_editor(tmp_path, "import sys\nsys.exit(1)\n")
+        result = run_edit(runner, session, "", env)
+        assert result.exit_code != 0
+        assert session.read_text() == original
+
+    def test_editor_not_found_leaves_file_unchanged(self, runner, tmp_path):
+        session = tmp_path / "session.sh"
+        original = "echo original\n"
+        session.write_text(original)
+        env = {"DOITLIVE_EDITOR": "definitely-not-a-real-editor-xyz"}
+        result = run_edit(runner, session, "", env)
+        assert result.exit_code != 0
+        assert session.read_text() == original
+
+    def test_aborting_session_leaves_file_unchanged(self, runner, tmp_path):
+        session = tmp_path / "session.sh"
+        original = "echo original\n"
+        session.write_text(original)
+        env = make_editor(
+            tmp_path,
+            "import sys\n"
+            "with open(sys.argv[1], 'w') as f:\n"
+            "    f.write('echo edited\\n')\n",
+        )
+        result = run_edit(runner, session, "echo" + doitlive.ESC, env)
+        assert result.exit_code > 0
+        assert session.read_text() == original
+
+    def test_repeated_runs_are_consistent(self, runner, tmp_path, monkeypatch):
+        # Replaying the same content must not leak state (cwd, $OLDPWD,
+        # exported variables) from one run into the next.
+        monkeypatch.delenv("OLDPWD", raising=False)
+        monkeypatch.delenv("DOITLIVE_LEAK", raising=False)
+        session = tmp_path / "session.sh"
+        session.write_text("cd ..\nexport DOITLIVE_LEAK=42\necho done\n")
+        env = make_editor(tmp_path, "import sys\nsys.exit(0)\n")
+        user_input = "".join(
+            [
+                random_string(len("cd ..")),
+                "\n",
+                random_string(len("export DOITLIVE_LEAK=42")),
+                "\n",
+                random_string(len("echo done")),
+            ]
+        )
+        cwd_before = os.getcwd()
+        result1 = run_edit(runner, session, user_input, env)
+        assert result1.exit_code == 0
+        assert os.getcwd() == cwd_before
+        assert "OLDPWD" not in os.environ
+        assert "DOITLIVE_LEAK" not in os.environ
+        result2 = run_edit(runner, session, user_input, env)
+        assert result2.exit_code == 0
+        assert result2.output == result1.output
+        assert os.getcwd() == cwd_before
+
+    def test_missing_session_file_is_created(self, runner, tmp_path):
+        session = tmp_path / "new-session.sh"
+        env = make_editor(
+            tmp_path,
+            "import sys\n"
+            "with open(sys.argv[1], 'w') as f:\n"
+            "    f.write('echo brand-new\\n')\n",
+        )
+        result = run_edit(runner, session, random_string(len("echo brand-new")), env)
+        assert result.exit_code == 0
+        assert session.read_text() == "echo brand-new\n"
+
+    def test_commit_preserves_file_permissions(self, runner, tmp_path):
+        session = tmp_path / "session.sh"
+        session.write_text("echo original\n")
+        session.chmod(0o640)
+        env = make_editor(tmp_path, "import sys\nsys.exit(0)\n")
+        result = run_edit(runner, session, random_string(len("echo original")), env)
+        assert result.exit_code == 0
+        assert stat.S_IMODE(session.stat().st_mode) == 0o640
 
 
 def test_themes_list(runner):
