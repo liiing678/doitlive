@@ -71,6 +71,21 @@ Stealth mode
 Hit the TAB key to enter "stealth mode." While in stealth mode, you can
 enter commands normally. Hit TAB again to exit stealth mode.
 
+Editing a session
+-----------------
+
+You can touch up a session file right before going live with the ``edit``
+command. It opens the session file in your ``$EDITOR`` and plays it as soon
+as the editor closes.
+
+.. code-block:: console
+
+    $ doitlive edit session.sh
+
+The edited content is saved back to the session file and the exact same
+content is played. If the editor exits abnormally, the session file is left
+untouched and nothing is played.
+
 Using the recorder
 ------------------
 

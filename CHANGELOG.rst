@@ -1,6 +1,21 @@
 Changelog
 ---------
 
+Unreleased
+**********
+
+Features:
+
+- Add ``doitlive edit`` command to edit a session file in ``$EDITOR``
+  before playing it. Editing and playback use the same content snapshot;
+  if the editor exits abnormally, the session file is left untouched.
+
+Fixes:
+
+- Restore the working directory and environment variables when a session
+  ends, even when it is aborted or a command fails, so that repeated runs
+  of the same content behave identically.
+
 5.2.1 (2026-02-16)
 ******************
 

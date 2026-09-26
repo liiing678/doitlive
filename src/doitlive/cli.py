@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import sys
+import tempfile
 import textwrap
 from codecs import open
 
@@ -169,79 +170,96 @@ def run(
         commentecho=commentecho,
     )
 
-    i = 0
-    while i < len(commands):
-        command = commands[i].strip()
-        i += 1
-        if not command:
-            continue
-        is_comment = command.startswith("#")
-        if not is_comment:
-            command_as_list = shlex.split(command)
-        else:
-            command_as_list = None
-        shell_match = SHELL_RE.match(command)
-        if is_comment:
-            # Parse comment magic
-            match = OPTION_RE.match(command)
-            if match:
-                option, arg = match.group("option"), match.group("arg")
-                func = OPTION_MAP[option]
-                func(state, arg)
-            elif state.commentecho():
-                comment = command.lstrip("#")
-                secho(comment, fg="yellow", bold=True)
-            continue
-        # Handle 'export' and 'alias' commands by storing them in SessionState
-        elif command_as_list and command_as_list[0] in ["alias", "export"]:
-            magictype(
-                command, prompt_template=state["prompt_template"], speed=state["speed"]
-            )
-            # Store the raw commands instead of using add_envvar and add_alias
-            # to avoid having to parse the command ourselves
-            state.add_command(command)
-        # Handle ```python and ```ipython by running "player" consoles
-        elif shell_match:
-            shell_name = shell_match.groups()[0].strip()
-            py_commands = []
-            more = True
-            while more:  # slurp up all the python code
-                try:
-                    py_command = commands[i].rstrip()
-                except IndexError as error:
-                    raise SessionError(
-                        f"Unmatched {shell_name} code block in session file."
-                    ) from error
-                i += 1
-                if py_command.startswith("```"):
-                    i += 1
-                    more = False
-                else:
-                    py_commands.append(py_command)
-            # Run the player console
-            magictype(
-                shell_name,
-                prompt_template=state["prompt_template"],
-                speed=state["speed"],
-            )
-
-            if shell_name == "ipython":
-                from doitlive.ipython import start_ipython_player
-
-                # dedent all the commands to account for IPython's autoindentation
-                ipy_commands = [textwrap.dedent(cmd) for cmd in py_commands]
-                start_ipython_player(ipy_commands, speed=state["speed"])
+    # Snapshot the working directory and environment so that they can be
+    # restored when the session ends, no matter how it ends. This keeps
+    # repeated runs of the same content isolated from each other.
+    saved_cwd = os.getcwd()
+    saved_env = os.environ.copy()
+    try:
+        i = 0
+        while i < len(commands):
+            command = commands[i].strip()
+            i += 1
+            if not command:
+                continue
+            is_comment = command.startswith("#")
+            if not is_comment:
+                command_as_list = shlex.split(command)
             else:
-                start_python_player(py_commands, speed=state["speed"])
-        else:
-            # goto_stealthmode determines when to switch to stealthmode
-            goto_stealthmode = magicrun(command, **state)
-            # stealthmode allows user to type live commands outside of automated script
-            i -= stealthmode(state, goto_stealthmode)
-    echo_prompt(state["prompt_template"])
-    wait_for(RETURNS)
-    if not quiet:
-        secho("FINISHED SESSION", fg="yellow", bold=True)
+                command_as_list = None
+            shell_match = SHELL_RE.match(command)
+            if is_comment:
+                # Parse comment magic
+                match = OPTION_RE.match(command)
+                if match:
+                    option, arg = match.group("option"), match.group("arg")
+                    func = OPTION_MAP[option]
+                    func(state, arg)
+                elif state.commentecho():
+                    comment = command.lstrip("#")
+                    secho(comment, fg="yellow", bold=True)
+                continue
+            # Handle 'export' and 'alias' commands by storing them in SessionState
+            elif command_as_list and command_as_list[0] in ["alias", "export"]:
+                magictype(
+                    command,
+                    prompt_template=state["prompt_template"],
+                    speed=state["speed"],
+                )
+                # Store the raw commands instead of using add_envvar and add_alias
+                # to avoid having to parse the command ourselves
+                state.add_command(command)
+            # Handle ```python and ```ipython by running "player" consoles
+            elif shell_match:
+                shell_name = shell_match.groups()[0].strip()
+                py_commands = []
+                more = True
+                while more:  # slurp up all the python code
+                    try:
+                        py_command = commands[i].rstrip()
+                    except IndexError as error:
+                        raise SessionError(
+                            f"Unmatched {shell_name} code block in session file."
+                        ) from error
+                    i += 1
+                    if py_command.startswith("```"):
+                        i += 1
+                        more = False
+                    else:
+                        py_commands.append(py_command)
+                # Run the player console
+                magictype(
+                    shell_name,
+                    prompt_template=state["prompt_template"],
+                    speed=state["speed"],
+                )
+
+                if shell_name == "ipython":
+                    from doitlive.ipython import start_ipython_player
+
+                    # dedent all the commands to account for IPython's autoindentation
+                    ipy_commands = [textwrap.dedent(cmd) for cmd in py_commands]
+                    start_ipython_player(ipy_commands, speed=state["speed"])
+                else:
+                    start_python_player(py_commands, speed=state["speed"])
+            else:
+                # goto_stealthmode determines when to switch to stealthmode
+                goto_stealthmode = magicrun(command, **state)
+                # stealthmode allows user to type live commands outside of automated script
+                i -= stealthmode(state, goto_stealthmode)
+        echo_prompt(state["prompt_template"])
+        wait_for(RETURNS)
+        if not quiet:
+            secho("FINISHED SESSION", fg="yellow", bold=True)
+    finally:
+        # Restore the pre-session working directory and environment, even
+        # when the session was aborted or a command failed.
+        os.environ.clear()
+        os.environ.update(saved_env)
+        try:
+            os.chdir(saved_cwd)
+        except OSError:
+            pass
 
 
 # Les CLI
@@ -412,6 +430,53 @@ def play(quiet, session_file, shell, speed, prompt, commentecho):
     """Play a session file."""
     run(
         session_file.readlines(),
+        shell=shell,
+        speed=speed,
+        quiet=quiet,
+        test_mode=TESTING,
+        prompt_template=prompt,
+        commentecho=commentecho,
+    )
+
+
+@player_command
+@click.argument(
+    "session_file",
+    type=click.Path(exists=True, dir_okay=False, readable=True, writable=True),
+)
+@cli.command()
+def edit(quiet, session_file, shell, speed, prompt, commentecho):
+    """Edit a session file in your editor, then play it.
+
+    The file is edited through a temporary copy. If the editor exits
+    abnormally, the session file is left untouched and nothing is played.
+    The exact content that was in the editor when it closed is what gets
+    saved back to the session file and played.
+    """
+    with open(session_file, encoding="utf-8") as fp:
+        original = fp.read()
+
+    fd, tmp_path = tempfile.mkstemp(prefix="doitlive-edit-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(original)
+        # Raises click.ClickException if the editor exits abnormally
+        click.edit(filename=tmp_path)
+        # Read the edited content exactly once: this snapshot is both what
+        # gets saved back to the session file and what gets played.
+        with open(tmp_path, encoding="utf-8") as tmp_file:
+            snapshot = tmp_file.read()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    with open(session_file, "w", encoding="utf-8") as fp:
+        fp.write(snapshot)
+
+    run(
+        snapshot.splitlines(keepends=True),
         shell=shell,
         speed=speed,
         quiet=quiet,

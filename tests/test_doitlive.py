@@ -3,6 +3,7 @@ import importlib.metadata
 import os
 import random
 import subprocess
+import tempfile
 from contextlib import contextmanager
 
 import pytest
@@ -118,6 +119,34 @@ class TestPlayer:
         assert result.exit_code == 0
         assert os.environ["HOME"] in result.output
 
+    def test_session_restores_cwd_and_env(self, runner, monkeypatch):
+        cwd = os.getcwd()
+        monkeypatch.delitem(os.environ, "OLDPWD", raising=False)
+        user_input = (
+            random_string(len("cd ~")) + "\n" + random_string(len("pwd")) + "\n"
+        )
+        try:
+            result = run_session(runner, "cd.session", user_input)
+            assert result.exit_code == 0
+            assert os.getcwd() == cwd
+            assert "OLDPWD" not in os.environ
+        finally:
+            os.chdir(cwd)
+
+    def test_repeated_runs_are_consistent(self, runner):
+        cwd = os.getcwd()
+        pwd_input = random_string(3)
+        cd_input = random_string(len("cd ~")) + "\n" + random_string(len("pwd")) + "\n"
+        try:
+            first = run_session(runner, "pwd.session", pwd_input)
+            # A session that changes cwd and env must not affect the next one
+            run_session(runner, "cd.session", cd_input)
+            second = run_session(runner, "pwd.session", pwd_input)
+            assert first.exit_code == second.exit_code == 0
+            assert first.output == second.output
+        finally:
+            os.chdir(cwd)
+
     def test_cd_bad(self, runner):
         user_input = (
             random_string(len("cd /thisisnotadirectory"))
@@ -194,6 +223,60 @@ class TestPlayer:
         )
         result = run_session(runner, "alias.session", user_input)
         assert "42" in result.output
+
+
+class TestEdit:
+    @pytest.fixture
+    def session_file(self, tmp_path):
+        path = tmp_path / "session.sh"
+        path.write_text('echo "before"\n', encoding="utf-8")
+        return path
+
+    @pytest.fixture
+    def editor(self, tmp_path):
+        """A fake $EDITOR that replaces the file's content."""
+        path = tmp_path / "editor.sh"
+        path.write_text(
+            '#!/bin/sh\nprintf \'echo "edited"\\n\' > "$1"\n', encoding="utf-8"
+        )
+        path.chmod(0o755)
+        return path
+
+    def run_edit(self, runner, session_file, editor, command):
+        user_in = "".join(["\n", random_string(len(command)), "\n\n"])
+        return runner.invoke(
+            cli,
+            ["edit", str(session_file)],
+            input=user_in,
+            env={"EDITOR": str(editor)},
+        )
+
+    def test_edit_then_play(self, runner, session_file, editor):
+        tmpdir = tempfile.gettempdir()
+        tmp_files_before = set(os.listdir(tmpdir))
+        result = self.run_edit(runner, session_file, editor, 'echo "edited"')
+        assert result.exit_code == 0
+        assert "edited" in result.output
+        # The edited content is saved back to the session file
+        assert session_file.read_text(encoding="utf-8") == 'echo "edited"\n'
+        # The temporary edit file is cleaned up
+        assert set(os.listdir(tmpdir)) == tmp_files_before
+
+    def test_editor_exits_abnormally(self, runner, session_file):
+        tmpdir = tempfile.gettempdir()
+        tmp_files_before = set(os.listdir(tmpdir))
+        result = runner.invoke(
+            cli, ["edit", str(session_file)], env={"EDITOR": "false"}
+        )
+        assert result.exit_code != 0
+        # The session file is left untouched and nothing is played
+        assert session_file.read_text(encoding="utf-8") == 'echo "before"\n'
+        # The temporary edit file is cleaned up
+        assert set(os.listdir(tmpdir)) == tmp_files_before
+
+    def test_edit_missing_file(self, runner):
+        result = runner.invoke(cli, ["edit", "doesnotexist.sh"])
+        assert result.exit_code != 0
 
 
 def test_themes_list(runner):
